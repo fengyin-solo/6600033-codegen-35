@@ -28,6 +28,35 @@ export interface HypTestResult {
   df?: number
 }
 
+export interface ChartPosition {
+  chartType: string
+  xValue?: number
+  yValue?: number
+  dataIndex?: number
+  pixelX?: number
+  pixelY?: number
+}
+
+export interface Annotation {
+  id: string
+  content: string
+  author: string
+  scenarioId: string
+  position?: ChartPosition
+  createdAt: string
+  updatedAt: string
+  resolved: boolean
+}
+
+export interface AnnotationCreate {
+  content: string
+  author: string
+  scenarioId: string
+  position?: ChartPosition
+}
+
+const API_BASE = 'http://localhost:8000/api'
+
 function normalRandom(): number {
   let u = 0, v = 0
   while (u === 0) u = Math.random()
@@ -112,6 +141,128 @@ export const useMCStore = defineStore('mc', () => {
   const result = ref<MCResult | null>(null)
   const testResult = ref<HypTestResult | null>(null)
   const isRunning = ref(false)
+  const annotations = ref<Annotation[]>([])
+  const selectedAnnotationId = ref<string | null>(null)
+  const pendingAnnotationPosition = ref<ChartPosition | null>(null)
+  const apiAvailable = ref(true)
+
+  const LOCAL_STORAGE_KEY = 'mc_annotations_v1'
+
+  function loadAnnotationsLocal() {
+    try {
+      const raw = localStorage.getItem(LOCAL_STORAGE_KEY)
+      if (raw) annotations.value = JSON.parse(raw)
+    } catch (e) {
+      annotations.value = []
+    }
+  }
+
+  function saveAnnotationsLocal() {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(annotations.value))
+    } catch (e) {}
+  }
+
+  function generateId() {
+    return 'ann_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
+  }
+
+  async function loadAnnotations(scenarioId?: string) {
+    const sid = scenarioId || currentScenario.value.id
+    try {
+      const res = await fetch(`${API_BASE}/annotations?scenarioId=${sid}`)
+      if (res.ok) {
+        const data = await res.json()
+        annotations.value = data
+        apiAvailable.value = true
+        saveAnnotationsLocal()
+        return
+      }
+    } catch (e) {}
+    apiAvailable.value = false
+    loadAnnotationsLocal()
+    annotations.value = annotations.value.filter(a => a.scenarioId === sid)
+  }
+
+  async function createAnnotation(data: AnnotationCreate): Promise<Annotation | null> {
+    const now = new Date().toISOString()
+    if (apiAvailable.value) {
+      try {
+        const res = await fetch(`${API_BASE}/annotations`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        })
+        if (res.ok) {
+          const ann = await res.json()
+          annotations.value.push(ann)
+          saveAnnotationsLocal()
+          return ann
+        }
+      } catch (e) {
+        apiAvailable.value = false
+      }
+    }
+    const ann: Annotation = {
+      id: generateId(),
+      content: data.content,
+      author: data.author,
+      scenarioId: data.scenarioId,
+      position: data.position,
+      createdAt: now,
+      updatedAt: now,
+      resolved: false
+    }
+    annotations.value.push(ann)
+    saveAnnotationsLocal()
+    return ann
+  }
+
+  async function updateAnnotation(id: string, updates: { content?: string; resolved?: boolean }) {
+    const now = new Date().toISOString()
+    if (apiAvailable.value) {
+      try {
+        const res = await fetch(`${API_BASE}/annotations/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates)
+        })
+        if (res.ok) {
+          const updated = await res.json()
+          const idx = annotations.value.findIndex(a => a.id === id)
+          if (idx >= 0) annotations.value[idx] = updated
+          saveAnnotationsLocal()
+          return
+        }
+      } catch (e) { apiAvailable.value = false }
+    }
+    const idx = annotations.value.findIndex(a => a.id === id)
+    if (idx >= 0) {
+      if (updates.content !== undefined) annotations.value[idx].content = updates.content
+      if (updates.resolved !== undefined) annotations.value[idx].resolved = updates.resolved
+      annotations.value[idx].updatedAt = now
+      saveAnnotationsLocal()
+    }
+  }
+
+  async function deleteAnnotation(id: string) {
+    if (apiAvailable.value) {
+      try {
+        const res = await fetch(`${API_BASE}/annotations/${id}`, { method: 'DELETE' })
+        if (res.ok) {
+          annotations.value = annotations.value.filter(a => a.id !== id)
+          saveAnnotationsLocal()
+          return
+        }
+      } catch (e) { apiAvailable.value = false }
+    }
+    annotations.value = annotations.value.filter(a => a.id !== id)
+    saveAnnotationsLocal()
+  }
+
+  function selectAnnotation(id: string | null) { selectedAnnotationId.value = id }
+
+  function setPendingPosition(pos: ChartPosition | null) { pendingAnnotationPosition.value = pos }
 
   function runSimulation() {
     isRunning.value = true
@@ -131,7 +282,13 @@ export const useMCStore = defineStore('mc', () => {
     testResult.value = { testType: 'Welch T检验', statistic: Math.round(t * 1000) / 1000, pValue: Math.round(pValue * 10000) / 10000, significant: pValue < 0.05, alpha: 0.05, df }
   }
 
-  function setScenario(s: MCScenario) { currentScenario.value = s; result.value = null }
+  function setScenario(s: MCScenario) {
+    currentScenario.value = s
+    result.value = null
+    selectedAnnotationId.value = null
+    pendingAnnotationPosition.value = null
+    loadAnnotations(s.id)
+  }
 
   const convergenceData = computed(() => {
     if (!result.value) return [] as [number, number][]
@@ -148,5 +305,25 @@ export const useMCStore = defineStore('mc', () => {
     return { xAxis: Array.from({ length: bins }, (_, i) => Math.round((mn + i * bs) * 100) / 100), data: counts }
   })
 
-  return { currentScenario, iterations, result, testResult, isRunning, convergenceData, histogramData, runSimulation, runTest, setScenario }
+  const activeAnnotations = computed(() => annotations.value.filter(a => !a.resolved))
+  const resolvedAnnotations = computed(() => annotations.value.filter(a => a.resolved))
+  const annotationsByChart = computed(() => {
+    const map: Record<string, Annotation[]> = { convergence: [], histogram: [] }
+    annotations.value.forEach(a => {
+      if (a.position?.chartType && map[a.position.chartType]) {
+        map[a.position.chartType].push(a)
+      }
+    })
+    return map
+  })
+
+  return {
+    currentScenario, iterations, result, testResult, isRunning,
+    annotations, selectedAnnotationId, pendingAnnotationPosition, apiAvailable,
+    activeAnnotations, resolvedAnnotations, annotationsByChart,
+    convergenceData, histogramData,
+    runSimulation, runTest, setScenario,
+    loadAnnotations, createAnnotation, updateAnnotation, deleteAnnotation,
+    selectAnnotation, setPendingPosition
+  }
 })
